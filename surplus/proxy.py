@@ -91,7 +91,10 @@ async def forward(
 
     async def body_iterator():
         try:
-            async for chunk in upstream.aiter_raw():
+            # aiter_bytes, not aiter_raw: httpx offers gzip upstream (good for
+            # the tunnel) and transparently inflates the stream here, so the
+            # downstream client always receives plain bytes.
+            async for chunk in upstream.aiter_bytes():
                 yield chunk
         finally:
             await upstream.aclose()
