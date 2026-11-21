@@ -2,7 +2,7 @@
 
 **English** · [فارسی](README.fa.md)
 
-![CI](https://github.com/amoda65/surplus/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/ZaniarManochehri/surplus/actions/workflows/ci.yml/badge.svg)
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue)
 ![Python](https://img.shields.io/badge/python-3.11%2B-green)
 
@@ -66,7 +66,7 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # 2) install the router straight from GitHub:
-uv tool install "git+https://github.com/amoda65/surplus.git"
+uv tool install "git+https://github.com/ZaniarManochehri/surplus.git"
 
 # 3) run it from anywhere:
 surplus
@@ -78,11 +78,11 @@ panel in your browser as soon as it's ready.
 Alternatives:
 
 ```bash
-pipx install "git+https://github.com/amoda65/surplus.git"
-pip  install "git+https://github.com/amoda65/surplus.git"
+pipx install "git+https://github.com/ZaniarManochehri/surplus.git"
+pip  install "git+https://github.com/ZaniarManochehri/surplus.git"
 
 # or from source
-git clone https://github.com/amoda65/surplus.git
+git clone https://github.com/ZaniarManochehri/surplus.git
 cd surplus
 uv sync && uv run python -m surplus.main
 ```
@@ -225,7 +225,7 @@ each model failed, and the detail drawer shows the live offers.
 ## Development
 
 ```bash
-git clone https://github.com/amoda65/surplus.git && cd surplus
+git clone https://github.com/ZaniarManochehri/surplus.git && cd surplus
 uv sync --extra dev
 uv run pytest -q                        # unit tests (offline, fixture-based)
 uv run ruff check surplus scripts tests

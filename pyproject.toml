@@ -25,9 +25,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/amoda65/surplus"
-Repository = "https://github.com/amoda65/surplus"
-Issues = "https://github.com/amoda65/surplus/issues"
+Homepage = "https://github.com/ZaniarManochehri/surplus"
+Repository = "https://github.com/ZaniarManochehri/surplus"
+Issues = "https://github.com/ZaniarManochehri/surplus/issues"
 
 [project.scripts]
 surplus = "surplus.main:main"
