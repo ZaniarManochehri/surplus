@@ -17,11 +17,15 @@
 که از فیلترهای شما عبور کنند** به ایجنت نشان می‌دهد، بقیه را قبل از اینکه
 یک سنت خرج شود به‌صورت محلی رد می‌کند، و قیمت‌ها را خودش تازه نگه می‌دارد.
 
+<div dir="ltr">
+
 ```text
 your agent ──► http://127.0.0.1:8404/v1 ──► filter gate ──► api.surplusintelligence.ai
                                                     │
                                           reject 403 (never forwarded)
 ```
+
+</div>
 
 ## چرا؟
 
@@ -167,10 +171,14 @@ OPENAI_API_KEY=***
 قبل کار می‌کنند — بدون TUN، بدون پروکسی سیستمی، بدون نیاز به روشن‌بودن VPN
 روی کل سیستم.
 
+<div dir="ltr">
+
 ```text
 agents ──► 127.0.0.1:8404 ──► [proxy tunnel] ──► api.surplusintelligence.ai
               everything else on the machine: untouched
 ```
+
+</div>
 
 دو حالت وجود دارد که در پنل مدیریت (کارت **Proxy tunnel**) یا در `config.ini`
 زیر `[proxy]` تنظیم می‌شوند:
