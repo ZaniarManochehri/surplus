@@ -244,6 +244,7 @@ surplus/
   tunnel.py      outbound tunnel: external proxy URL, or managed Xray-core child
                  process with probe / rotate / subscription refresh
   subscription.py  vless/vmess/trojan/ss link parsing -> Xray outbounds + client config
+  doctor.py      `surplus doctor`: config, DNS, direct route, subscription, xray, live tunnel
   config.py      config.ini load/save (stdlib configparser), env override, atomic write
   static/
     index.html   admin panel
@@ -294,6 +295,17 @@ downloads the release binary into the per-user config dir (or uses
     `proxy_tunnel_down` upstream errors, admin card with state badge /
     rotate / test — 170 unit tests green, 8/8 `scripts/verify_proxy.py` checks
     green against the live API through a real subscription
+5e. ✅ **Non-blocking startup + doctor**: the lifespan only starts background
+    tasks; the supervisor brings the tunnel up and loads the catalog on its
+    first tick, so the port binds in about a second whatever the network
+    does. Gated `/v1` requests wait for the catalog warm-up (90 s budget)
+    instead of being rejected as unknown; client swaps reload the catalog in
+    the background, so admin endpoints never wait on a slow marketplace.
+    `surplus doctor` checks config, DNS, the direct route, subscription
+    parsing, the Xray binary and a live tunnel, and prints what to fix. A
+    stale Xray cache (older than v25) is replaced; an xray already on the
+    PATH is the fallback when the GitHub download is blocked. 187 unit tests,
+    8/8 `verify_proxy` checks.
 6. **Anthropic skin**: `/anthropic/*` passthrough + filtered model list
 7. **End-to-end verification**: OpenAI SDK and Claude Code through the proxy;
    rejection test for a capped-out model; streaming test; refresh test

@@ -25,6 +25,13 @@ with OpenAI-compatible or Anthropic-compatible protocols. The proxy:
 - **Avoid unstable third-party deps.** Core deps: fastapi, uvicorn, httpx.
 - **Verify against the live API**, never against assumed response shapes.
   Probe first, code second.
+- **Startup never blocks on the network.** The lifespan only starts tasks:
+  the port binds first, and the tunnel plus the first catalog load follow in
+  the background. Anything slow belongs in the supervisor loop or a
+  background task, never in a path the admin panel needs to answer.
+- **Diagnose with `surplus doctor`.** When a tunnel will not come up on
+  someone's machine, the doctor output (never the subscription URL or links)
+  is what gets shared.
 
 ## Filter semantics (agreed with owner)
 

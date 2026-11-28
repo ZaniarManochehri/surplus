@@ -100,23 +100,57 @@ def test_wait_for_port_false_when_nothing_listens() -> None:
 
 
 def test_wait_for_port_wakes_when_server_binds_late() -> None:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
+    # Bound but NOT listening: connections are refused until listen() runs.
+    # Holding the socket keeps the port ours, so a concurrent outbound
+    # connection on the machine cannot grab it in between (that made this
+    # test flaky on busy hosts).
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
 
-    def bind_later() -> None:
+    def listen_later() -> None:
         time.sleep(0.4)
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind(("127.0.0.1", port))
-            sock.listen(1)
-            time.sleep(1.5)
+        sock.listen(1)
+        time.sleep(1.5)
 
-    thread = threading.Thread(target=bind_later, daemon=True)
+    thread = threading.Thread(target=listen_later, daemon=True)
     thread.start()
     try:
         assert wait_for_port("127.0.0.1", port, timeout=5.0) is True
     finally:
         thread.join(timeout=3)
+        sock.close()
+
+
+def test_cli_runs_by_default_and_exposes_doctor() -> None:
+    from surplus.main import parse_args
+
+    assert parse_args([]).command == "run"
+    doctor = parse_args(["doctor"])
+    assert doctor.command == "doctor"
+    # doctor still honours the shared options
+    assert parse_args(["doctor", "--config", "x.ini"]).config == "x.ini"
+    with pytest.raises(SystemExit) as excinfo:
+        parse_args(["--version"])
+    assert excinfo.value.code == 0  # argparse prints the version and exits 0
+
+
+def test_lifespan_never_awaits_network_work() -> None:
+    """Regression: startup used to await the tunnel before binding the port.
+
+    On a slow network that kept the socket unbound for minutes, so the admin
+    panel was unreachable and the browser auto-open gave up. The lifespan body
+    must not await apply_proxy() or a catalog refresh before yielding.
+    """
+    import inspect
+
+    from surplus import main as main_mod
+
+    source = inspect.getsource(main_mod.lifespan)
+    head = source.split("yield", 1)[0]
+    assert "await state.apply_proxy" not in head
+    assert "await state.catalog.refresh" not in head
+    assert "create_task(_supervisor_loop" in head
 
 
 def test_open_browser_when_ready_calls_opener_with_admin_url() -> None:

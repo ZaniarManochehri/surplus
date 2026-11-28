@@ -24,6 +24,8 @@ import json
 import logging
 import os
 import platform
+import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -43,6 +45,9 @@ log = logging.getLogger("surplus.tunnel")
 XRAY_RELEASE_URL = "https://github.com/XTLS/Xray-core/releases/latest/download/{asset}"
 SUBSCRIPTION_USER_AGENT = "v2rayN/6.45"
 PROBE_PATH = "/v1/models"
+# Post-quantum VLESS encryption (mlkem768x25519plus...) needs Xray v25+; an
+# older cached binary is replaced instead of failing on every route.
+MIN_XRAY_MAJOR = 25
 
 
 class Tunnel:
@@ -195,6 +200,9 @@ class Tunnel:
                 "version": self._xray_version,
                 "binary": str(self._binary) if self._binary else "",
                 "workdir": str(self.workdir),
+                # Last lines of xray's own log: the only place that says WHY a
+                # route refused to start (old core, blocked port, bad config).
+                "log_tail": self._log_tail_lines(),
             },
             "health": {
                 "last_probe_at": _iso(self._last_probe_at),
@@ -347,7 +355,7 @@ class Tunnel:
             return
         self._skipped = skipped
         if not servers:
-            self._last_error = "subscription contained no usable links"
+            self._last_error = self._describe_no_links("subscription")
             return
         previous = self._servers[self._index].address if self._servers else None
         self._servers = servers
@@ -366,12 +374,25 @@ class Tunnel:
         servers, skipped = parse_subscription(text)
         self._skipped = skipped
         if not servers:
-            self._last_error = "no usable links in subscription_links"
+            self._last_error = self._describe_no_links("subscription_links")
             return False
         self._servers = servers
         self._subscription_fetched_at = time.time()
         self._index = 0
         return True
+
+    def _describe_no_links(self, source: str) -> str:
+        """Actionable message when a subscription yielded zero usable routes."""
+        if self._skipped:
+            reasons = "; ".join(self._skipped[:4])
+            extra = (
+                f" (+{len(self._skipped) - 4} more)" if len(self._skipped) > 4 else ""
+            )
+            return (
+                f"{source} contained no usable links: {reasons}{extra}. "
+                "Supported protocols: vless, vmess, trojan, ss."
+            )
+        return f"{source} contained no usable links."
 
     # -------------------------------------------------------------- binaries
 
@@ -380,22 +401,47 @@ class Tunnel:
             path = Path(cfg.xray_binary).expanduser()
             if path.exists():
                 self._binary = path
+                await self._read_version(path)
                 return path
             self._last_error = f"xray_binary not found: {path}"
             return None
+        on_path = shutil.which("xray")
         if self._binary is not None and self._binary.exists():
             return self._binary
         self.workdir.mkdir(parents=True, exist_ok=True)
         candidate = self.workdir / ("xray.exe" if os.name == "nt" else "xray")
-        if not candidate.exists():
-            try:
-                await self._download_binary(candidate)
-            except Exception as exc:  # noqa: BLE001 - reported through status
-                self._last_error = (
-                    f"xray download failed: {type(exc).__name__}: {exc}. "
-                    "Install Xray-core manually and set [proxy] xray_binary."
-                )
-                return None
+        if candidate.exists():
+            major = await self._read_version(candidate)
+            if major is None or major >= MIN_XRAY_MAJOR:
+                self._binary = candidate
+                return candidate
+            # Too old for post-quantum VLESS configs; replace it once.
+            log.info(
+                "cached Xray %s is older than v%d; downloading a current release",
+                self._xray_version or "?",
+                MIN_XRAY_MAJOR,
+            )
+            with contextlib.suppress(OSError):
+                candidate.unlink()
+        try:
+            await self._download_binary(candidate)
+        except Exception as exc:  # noqa: BLE001 - reported through status
+            if on_path:
+                # GitHub unreachable: an xray already on PATH is a usable fallback.
+                major = await self._read_version(Path(on_path))
+                if major is None or major >= MIN_XRAY_MAJOR:
+                    log.warning(
+                        "xray download failed (%s); using the one on PATH: %s",
+                        type(exc).__name__,
+                        on_path,
+                    )
+                    self._binary = Path(on_path)
+                    return self._binary
+            self._last_error = (
+                f"xray download failed: {type(exc).__name__}: {exc}. "
+                "Install Xray-core manually and set [proxy] xray_binary."
+            )
+            return None
         self._binary = candidate
         await self._read_version(candidate)
         return candidate
@@ -426,7 +472,8 @@ class Tunnel:
         if os.name != "nt":
             target.chmod(0o755)
 
-    async def _read_version(self, binary: Path) -> None:
+    async def _read_version(self, binary: Path) -> int | None:
+        """Run ``xray version``; store the banner and return the major number."""
         try:
             proc = await asyncio.create_subprocess_exec(
                 str(binary),
@@ -440,6 +487,9 @@ class Tunnel:
             self._xray_version = lines[0].strip() if lines else ""
         except Exception:  # noqa: BLE001 - version is cosmetic
             self._xray_version = ""
+            return None
+        match = re.search(r"Xray\s+(\d+)\.", self._xray_version)
+        return int(match.group(1)) if match else None
 
     # -------------------------------------------------------------- process
 
@@ -480,6 +530,13 @@ class Tunnel:
                     proc.kill()
                 with contextlib.suppress(Exception):
                     await proc.wait()
+        if proc is not None:
+            # Our own child is gone: drop its pid file so nothing tries to
+            # "clean up" a pid that may belong to another process by now.
+            pid_file = self.workdir / "xray.pid"
+            with contextlib.suppress(OSError, ValueError):
+                if int(pid_file.read_text(encoding="utf-8").strip()) == proc.pid:
+                    pid_file.unlink()
         if self._log_handle is not None:
             with contextlib.suppress(Exception):
                 self._log_handle.close()
@@ -515,14 +572,17 @@ class Tunnel:
                 await asyncio.sleep(0.15)
         return False
 
-    def _log_tail(self, lines: int = 6) -> str:
+    def _log_tail_lines(self, lines: int = 8) -> list[str]:
         try:
             text = (self.workdir / "xray.log").read_text(
                 encoding="utf-8", errors="replace"
             )
         except OSError:
-            return ""
-        tail = [line.strip() for line in text.splitlines()[-lines:] if line.strip()]
+            return []
+        return [line.strip() for line in text.splitlines()[-lines:] if line.strip()]
+
+    def _log_tail(self, lines: int = 6) -> str:
+        tail = self._log_tail_lines(lines)
         return f" ({'; '.join(tail)})" if tail else ""
 
     # ----------------------------------------------------------------- probe

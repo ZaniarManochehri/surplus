@@ -553,10 +553,16 @@ function renderProxyStatus(proxy) {
       "Subscription",
       `${sub.servers ?? 0} route(s)${sub.skipped?.length ? `, ${sub.skipped.length} skipped` : ""}`,
     ],
+    ...(sub.skipped?.length
+      ? [["Skipped links", `<span class="reasons">${escapeHtml(sub.skipped.join("; "))}</span>`]]
+      : []),
+    ...(proxy.state !== "up" && xray.log_tail?.length
+      ? [["Xray log", `<span class="reasons">${escapeHtml(xray.log_tail.slice(-3).join(" | "))}</span>`]]
+      : []),
     ["Last error", proxy.last_error ? escapeHtml(proxy.last_error) : "none"],
   ];
   kv.innerHTML = rows
-    .map(([k, v]) => `<span>${k}</span><strong>${v}</strong>`)
+    .map(([k, v]) => `<span>${k}</span><strong style="word-break:break-word">${v}</strong>`)
     .join("");
 
   const enabled = proxy.enabled;

@@ -1,6 +1,6 @@
 [project]
 name = "surplus-router"
-version = "0.2.0"
+version = "0.2.1"
 description = "Local price-filtered proxy router for the Surplus Intelligence marketplace"
 readme = "README.md"
 license = { text = "MIT" }

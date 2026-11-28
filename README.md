@@ -222,6 +222,36 @@ doing any work and exits with a clear message.
 tokens**; `$0.10/1M` is genuinely cheap. The catalog table shows exactly why
 each model failed, and the detail drawer shows the live offers.
 
+**The browser did not open, or the terminal said "the server did not accept
+connections"** — the router binds its port immediately and brings the tunnel up
+in the background, so the panel answers within a second or two whatever the
+network does. Earlier builds waited for the tunnel before binding, and on a
+slow or filtered network that took minutes; update (`uv tool upgrade
+surplus-router`, then check `surplus --version`) and open
+<http://127.0.0.1:8404/admin>.
+
+**The subscription does not connect** — run `surplus doctor`. It checks the
+config, API key, DNS, the direct route, the subscription (HTTP status, link
+types, skipped links), the Xray binary, then starts a real test tunnel and
+prints what to fix. What it usually finds:
+
+- **Unsupported protocol** (`hysteria2`, `tuic`): Xray-core only speaks
+  `vless`, `vmess`, `trojan` and `ss`. Ask the provider for a VLESS link, or
+  paste one into `subscription_links`.
+- **`xray download failed`**: github.com is blocked on that network. Put
+  `xray` on the `PATH`, or install it anywhere and set `[proxy] xray_binary`.
+- **`did not listen`** in the tunnel test: an antivirus or SmartScreen rule is
+  blocking the downloaded `xray.exe`. Allow it, or point `xray_binary` at a
+  copy you installed yourself.
+- **`clock` check fails**: fix the system date/time; TLS needs it.
+
+The panel shows the same facts on the **Proxy tunnel** card: state, skipped
+links and the last lines of Xray's log.
+
+**Keeping the install current** — `uv tool install` snapshots the code at
+install time. After a fix is pushed, run `uv tool upgrade surplus-router` (or
+reinstall with `--force`) and confirm with `surplus --version`.
+
 ## Development
 
 ```bash
@@ -231,6 +261,8 @@ uv run pytest -q                        # unit tests (offline, fixture-based)
 uv run ruff check surplus scripts tests
 uv run python scripts/verify_local.py   # end-to-end checks against the live API
 uv run python scripts/verify_admin.py   # admin panel checks against the live API
+uv run python scripts/verify_proxy.py   # tunnel checks (needs VERIFY_SUBSCRIPTION_URL)
+uv run python -m surplus.doctor         # environment diagnostics, same as `surplus doctor`
 ```
 
 Design notes live in [`SPEC.md`](SPEC.md); project conventions in

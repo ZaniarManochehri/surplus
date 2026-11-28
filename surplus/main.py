@@ -61,6 +61,12 @@ PASS_THROUGH_PATHS = {
     "images/generations",
 }
 
+# The socket binds before the first catalog load (startup never waits on the
+# network). These bound how long a request waits for that first load instead
+# of seeing an empty catalog.
+CATALOG_WARMUP_SECONDS = 90.0  # a gated chat/completions call
+CATALOG_LIST_WAIT_SECONDS = 30.0  # GET /v1/models and friends
+
 
 class State:
     """Mutable app state: config can be reloaded in-process without restart."""
@@ -74,8 +80,10 @@ class State:
         self.tunnel = Tunnel(lambda: self.cfg.proxy, self.cfg.upstream.base_url)
         self.client_proxy_url: str | None = None
         self._retired: list[httpx.AsyncClient] = []
+        self._background: set[asyncio.Task] = set()
         self.refresh_task: asyncio.Task | None = None
         self.supervisor_task: asyncio.Task | None = None
+        self.catalog_ready = asyncio.Event()
         self.started_at = time.time()
 
     def swap_client(self, new_client: httpx.AsyncClient) -> None:
@@ -105,6 +113,48 @@ class State:
         with contextlib.suppress(Exception):
             await client.aclose()
 
+    # ------------------------------------------------------------- catalog
+
+    async def refresh_catalog(self) -> bool:
+        """One catalog load through the current client; arms the warm-up gate."""
+        ok = await self.catalog.refresh(self.client)
+        if self.catalog.models:
+            self.catalog_ready.set()
+        return ok
+
+    def refresh_catalog_soon(self) -> None:
+        """Reload the catalog in the background.
+
+        Admin endpoints must not wait on a slow marketplace, and a route
+        restart must never tear down a refresh some caller is awaiting.
+        """
+        task = asyncio.create_task(self._refresh_in_background())
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    async def _refresh_in_background(self) -> None:
+        try:
+            await self.refresh_catalog()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - logged, never fatal
+            log.warning("background catalog refresh failed: %s", exc)
+
+    async def wait_for_catalog(self, timeout: float) -> bool:
+        """True once the catalog has loaded at least once in this process.
+
+        The port binds before the first load (startup never blocks on the
+        network), so callers that need the catalog wait here instead of
+        seeing an empty one.
+        """
+        if self.catalog.models:
+            return True
+        try:
+            await asyncio.wait_for(self.catalog_ready.wait(), timeout)
+        except TimeoutError:
+            pass
+        return bool(self.catalog.models)
+
     async def sync_client(self) -> None:
         """Point the upstream client at the tunnel's current proxy URL."""
         wanted = self.tunnel.proxy_url()
@@ -114,7 +164,7 @@ class State:
             self.swap_client(
                 build_client(self.cfg.upstream.request_timeout_seconds, wanted)
             )
-            await self.catalog.refresh(self.client)
+            self.refresh_catalog_soon()
 
     async def apply_proxy(self) -> dict:
         """Apply the current [proxy] settings; returns the tunnel status."""
@@ -123,6 +173,8 @@ class State:
         return self.tunnel.status()
 
     async def close_clients(self) -> None:
+        for task in list(self._background):
+            task.cancel()
         for client in list(self._retired) + [self.client]:
             with contextlib.suppress(Exception):
                 await client.aclose()
@@ -302,25 +354,16 @@ def _none_last(value: float | None) -> float:
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load the catalog at startup, then refresh it on a TTL loop forever."""
+    """Bind the socket immediately; network work runs in background tasks.
+
+    Startup used to await the tunnel before serving. In managed mode that
+    means an Xray download plus a probe per subscribed route - on a slow or
+    filtered network the socket stayed unbound for minutes, the admin panel
+    was unreachable and the browser auto-open gave up. Nothing here may
+    block the bind: the supervisor below brings the tunnel up and refreshes
+    the catalog on its first tick.
+    """
     log.info("config file: %s", CONFIG_PATH)
-
-    # Bring the proxy tunnel up first (managed mode may download Xray-core);
-    # a failure here is not fatal: the router runs direct and reports why.
-    global _applied_proxy_fp
-    await state.apply_proxy()
-    _applied_proxy_fp = _proxy_fingerprint(state.cfg)
-
-    ok = await state.catalog.refresh(state.client)
-    if ok:
-        log.info(
-            "catalog loaded: %d models (%d passing filters)",
-            len(state.catalog.models),
-            len(filtered_models()),
-        )
-    else:
-        log.warning("startup catalog refresh failed; retrying in background")
-
     state.refresh_task = asyncio.create_task(_refresh_loop())
     state.supervisor_task = asyncio.create_task(_supervisor_loop())
     try:
@@ -339,26 +382,34 @@ async def _refresh_loop() -> None:
     while True:
         ttl = max(5, state.cfg.upstream.catalog_ttl_seconds)
         await asyncio.sleep(ttl)
-        await state.catalog.refresh(state.client)
+        await state.refresh_catalog()
 
 
 async def _supervisor_loop() -> None:
     """Watch the tunnel: probe, rotate, refresh the subscription, and pick up
-    manual edits made to the [proxy] section of config.ini."""
+    manual edits made to the [proxy] section of config.ini.
+
+    The first tick runs immediately: startup no longer applies the tunnel, so
+    this is what brings it up (and loads the first catalog) right after the
+    port is bound.
+    """
     global _applied_proxy_fp
+    first = True
     while True:
-        interval = max(10, state.cfg.proxy.health_check_interval_seconds)
-        await asyncio.sleep(interval)
+        if not first:
+            await asyncio.sleep(max(10, state.cfg.proxy.health_check_interval_seconds))
+        first = False
         try:
             maybe_reload_config()
             fingerprint = _proxy_fingerprint(state.cfg)
             if fingerprint != _applied_proxy_fp:
-                log.info("[proxy] settings changed; re-applying tunnel")
                 await state.apply_proxy()
                 _applied_proxy_fp = fingerprint
-                continue
-            await state.tunnel.health_tick()
-            await state.sync_client()
+            else:
+                await state.tunnel.health_tick()
+                await state.sync_client()
+            if not state.catalog.models:
+                await state.refresh_catalog()
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - the supervisor must never die
@@ -536,7 +587,7 @@ async def admin_account_requests(request: Request) -> JSONResponse:
 @app.post("/admin/api/refresh")
 async def admin_refresh() -> JSONResponse:
     maybe_reload_config()
-    ok = await state.catalog.refresh(state.client)
+    ok = await state.refresh_catalog()
     return JSONResponse(
         {
             "ok": ok,
@@ -791,12 +842,16 @@ async def admin_set_config(request: Request, payload: dict[str, Any]) -> JSONRes
 @app.get("/v1/models")
 async def list_models() -> JSONResponse:
     maybe_reload_config()
+    # The port binds before the first catalog load, so a client that asks at
+    # once gets the real list a moment later instead of an empty one.
+    await state.wait_for_catalog(CATALOG_LIST_WAIT_SECONDS)
     return JSONResponse({"object": "list", "data": filtered_models()})
 
 
 @app.get("/v1/models/{model_id}")
 async def retrieve_model(model_id: str) -> JSONResponse:
     maybe_reload_config()
+    await state.wait_for_catalog(CATALOG_LIST_WAIT_SECONDS)
     model = state.catalog.models.get(model_id)
     if model is None:
         return JSONResponse(
@@ -831,6 +886,12 @@ async def proxy_v1(sub_path: str, request: Request):
                     model_id = raw_model
 
     if model_id is not None or sub_path.strip("/") in PASS_THROUGH_PATHS:
+        if not state.catalog.models and not state.cfg.filters.allow_unknown_models:
+            # Warm-up: the gate is fail-closed on unknown models, but "unknown"
+            # must not mean "not loaded yet". Startup no longer blocks on the
+            # network, so give the first catalog load a fair chance instead of
+            # answering 403 for a model that exists.
+            await state.wait_for_catalog(CATALOG_WARMUP_SECONDS)
         error = gate_model(model_id)
         if error is not None:
             return error
@@ -916,12 +977,14 @@ def wait_for_port(host: str, port: int, timeout: float = 20.0) -> bool:
 
 
 def open_browser_when_ready(
-    url: str, host: str, port: int, timeout: float = 20.0, opener=webbrowser.open
+    url: str, host: str, port: int, timeout: float = 120.0, opener=webbrowser.open
 ) -> threading.Thread:
     """Open the admin panel once the server actually accepts connections.
 
     Runs on a daemon thread so it never delays or blocks startup, and never
-    opens a tab that would just show a connection error.
+    opens a tab that would just show a connection error. The timeout is
+    generous (two minutes) because a machine can be slow to bind under load;
+    if it still misses, the message points at the panel URL explicitly.
     """
 
     def _run() -> None:
@@ -933,8 +996,11 @@ def open_browser_when_ready(
                 log.warning("could not open a browser (%s); admin panel is at %s", exc, url)
         else:
             log.warning(
-                "server did not accept connections within %.0fs; not opening a browser",
+                "the server did not accept connections within %.0fs, so no browser "
+                "was opened. The router is still starting: open %s manually once "
+                "the terminal reports it is listening.",
                 timeout,
+                url,
             )
 
     thread = threading.Thread(target=_run, name="open-admin-browser", daemon=True)
@@ -946,6 +1012,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="surplus-router",
         description="Local price-filtered proxy for the Surplus Intelligence marketplace.",
+        epilog=(
+            "run `surplus doctor` when the panel does not open or the tunnel will "
+            "not connect: it checks config, network, subscription and Xray, and "
+            "prints what to fix."
+        ),
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="run",
+        choices=["run", "doctor"],
+        help="'doctor' runs environment diagnostics instead of the router",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"surplus-router {__version__}",
+        help="print the installed version and exit",
     )
     parser.add_argument(
         "--host",
@@ -976,6 +1060,11 @@ def main(argv: list[str] | None = None) -> int:
     global CONFIG_PATH
     CONFIG_PATH = resolve_config_path(args.config)
 
+    if args.command == "doctor":
+        from .doctor import run as run_doctor
+
+        return asyncio.run(run_doctor(CONFIG_PATH))
+
     cfg = ensure_config(CONFIG_PATH)
     # The module-level state was built at import time; point it at the resolved
     # config so --config and the installed-tool layout both work.
@@ -1002,7 +1091,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if cfg.server.open_browser and not args.no_browser:
         # Waits for the socket to accept connections, then opens the panel.
-        open_browser_when_ready(url, host, port)
+        open_browser_when_ready(url, host, port, timeout=120.0)
     else:
         log.info("browser auto-open disabled; admin panel is at %s", url)
 

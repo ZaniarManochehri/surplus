@@ -6,10 +6,12 @@ No process is spawned and no network is touched: the tunnel's collaborators
 
 from __future__ import annotations
 
+import os
+import shutil
 from pathlib import Path
 
 from surplus.config import ProxyConfig
-from surplus.subscription import Server
+from surplus.subscription import Server, parse_subscription
 from surplus.tunnel import Tunnel
 
 
@@ -226,3 +228,106 @@ async def test_stop_clears_port_and_state(tmp_path: Path, monkeypatch) -> None:
     await tunnel.stop()
     assert tunnel.status()["state"] == "stopped"
     assert tunnel.proxy_url() is None
+
+
+# ------------------------------------------------------------ binary lookup
+
+
+def _binary_name() -> str:
+    return "xray.exe" if os.name == "nt" else "xray"
+
+
+def test_unsupported_links_are_named_in_the_error(tmp_path: Path) -> None:
+    """A subscription of hysteria2 links must say so, not 'no usable links'."""
+    tunnel, _ = make_tunnel(ProxyConfig(enabled=True, mode="managed"), tmp_path)
+    text = "hysteria2://a@h:443?sni=x#1\ntuic://b@h:443#2\nvless://@h:80"
+    servers, skipped = parse_subscription(text)
+    assert servers == []
+    tunnel._skipped = skipped
+    message = tunnel._describe_no_links("subscription")
+    assert "hysteria2: unsupported protocol" in message
+    assert "tuic" in message
+    assert "vless, vmess, trojan, ss" in message
+
+
+async def test_stale_cached_binary_is_replaced(
+    tmp_path: Path, monkeypatch
+) -> None:
+    tunnel, _ = make_tunnel(ProxyConfig(enabled=True, mode="managed"), tmp_path)
+    workdir = tmp_path / "xray"
+    workdir.mkdir(parents=True)
+    cached = workdir / _binary_name()
+    cached.write_bytes(b"old-core")
+    majors = iter([24, 26])  # cached read is old, the fresh download is current
+
+    async def fake_read_version(self, binary):
+        major = next(majors)
+        self._xray_version = f"Xray {major}.0.0"
+        return major
+
+    downloads: list[Path] = []
+
+    async def fake_download(self, target: Path) -> None:
+        downloads.append(target)
+        target.write_bytes(b"new-core")
+
+    monkeypatch.setattr(Tunnel, "_read_version", fake_read_version)
+    monkeypatch.setattr(Tunnel, "_download_binary", fake_download)
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+
+    binary = await tunnel._ensure_binary(ProxyConfig())
+
+    assert downloads == [cached]  # replaced in place, exactly once
+    assert binary == cached
+    assert cached.read_bytes() == b"new-core"
+    assert tunnel.status()["xray"]["version"] == "Xray 26.0.0"
+
+
+async def test_download_failure_falls_back_to_path_binary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    tunnel, _ = make_tunnel(ProxyConfig(enabled=True, mode="managed"), tmp_path)
+    on_path = tmp_path / "bin-xray"
+    on_path.write_bytes(b"path-core")
+
+    async def fake_read_version(self, binary):
+        self._xray_version = "Xray 26.1.0"
+        return 26
+
+    async def failing_download(self, target: Path) -> None:
+        raise OSError("github unreachable")
+
+    monkeypatch.setattr(Tunnel, "_read_version", fake_read_version)
+    monkeypatch.setattr(Tunnel, "_download_binary", failing_download)
+    monkeypatch.setattr(shutil, "which", lambda name: str(on_path) if name == "xray" else None)
+
+    binary = await tunnel._ensure_binary(ProxyConfig())
+
+    assert binary == on_path
+    assert tunnel.status()["last_error"] == ""
+
+
+async def test_download_failure_without_any_binary_is_reported(
+    tmp_path: Path, monkeypatch
+) -> None:
+    tunnel, _ = make_tunnel(ProxyConfig(enabled=True, mode="managed"), tmp_path)
+
+    async def failing_download(self, target: Path) -> None:
+        raise OSError("github unreachable")
+
+    monkeypatch.setattr(Tunnel, "_download_binary", failing_download)
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+
+    assert await tunnel._ensure_binary(ProxyConfig()) is None
+    error = tunnel.status()["last_error"]
+    assert "xray download failed" in error
+    assert "xray_binary" in error  # tells the user the manual way out
+
+
+def test_status_carries_xray_log_tail(tmp_path: Path) -> None:
+    tunnel, _ = make_tunnel(ProxyConfig(enabled=True, mode="managed"), tmp_path)
+    tunnel.workdir.mkdir(parents=True)
+    (tunnel.workdir / "xray.log").write_text(
+        "line one\n\nline two\nline three\n", encoding="utf-8"
+    )
+    assert tunnel.status()["xray"]["log_tail"] == ["line one", "line two", "line three"]
