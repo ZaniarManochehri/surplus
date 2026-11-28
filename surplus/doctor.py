@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import logging
 import os
 import platform
 import shutil
@@ -41,8 +42,8 @@ from .config import (
     resolve_api_key,
     user_config_dir,
 )
-from .subscription import extract_links, parse_subscription
-from .tunnel import SUBSCRIPTION_USER_AGENT, Tunnel
+from .subscription import Server, parse_subscription
+from .tunnel import Tunnel, fetch_subscription
 
 NAME_WIDTH = 13
 PASS, WARN, FAIL, INFO = "PASS", "WARN", "FAIL", "INFO"
@@ -77,8 +78,11 @@ def _xray_binary_name() -> str:
     return "xray.exe" if os.name == "nt" else "xray"
 
 
-async def _direct_probe(base_url: str, proxy: str | None) -> tuple[bool, str]:
-    """One GET to the marketplace. Any HTTP answer means the path works."""
+async def _direct_probe(base_url: str, proxy: str | None) -> tuple[bool, str, str | None]:
+    """One GET to the marketplace. Any HTTP answer means the path works.
+
+    Returns ``(ok, detail, date_header)``; the header feeds the clock check.
+    """
     timeout = httpx.Timeout(connect=10.0, read=15.0, write=10.0, pool=10.0)
     kwargs: dict = {"proxy": proxy, "trust_env": False} if proxy else {"trust_env": False}
     started = time.perf_counter()
@@ -86,9 +90,9 @@ async def _direct_probe(base_url: str, proxy: str | None) -> tuple[bool, str]:
         async with httpx.AsyncClient(timeout=timeout, **kwargs) as client:
             response = await client.get(f"{base_url.rstrip('/')}/v1/models")
     except Exception as exc:  # noqa: BLE001 - the error text is the diagnosis
-        return False, f"{type(exc).__name__}: {_short(exc)}"
+        return False, f"{type(exc).__name__}: {_short(exc)}", None
     ms = int((time.perf_counter() - started) * 1000)
-    return True, f"HTTP {response.status_code} in {ms} ms"
+    return True, f"HTTP {response.status_code} in {ms} ms", response.headers.get("date")
 
 
 def _short(exc: BaseException, limit: int = 150) -> str:
@@ -100,9 +104,11 @@ def _looks_filtered(ip: str) -> bool:
     return ip.startswith(FILTERED_IP_PREFIXES)
 
 
-async def _check_clock(report: Report, response: httpx.Response | None) -> None:
-    """TLS fails silently when the system clock is far off; check against Date."""
-    raw = response.headers.get("date") if response is not None else None
+async def _check_clock(report: Report, raw: str | None) -> None:
+    """TLS fails silently when the system clock is far off; check against Date.
+
+    ``raw`` is the HTTP ``Date`` header of any server that answered.
+    """
     if not raw:
         return
     try:
@@ -125,6 +131,10 @@ async def run(config_path: Path | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         with contextlib.suppress(Exception):  # old consoles, redirected pipes
             stream.reconfigure(errors="replace")
+    # This output gets pasted into chats and tickets: httpx's request lines
+    # would print the subscription URL in full.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
     print(f"Surplus Router doctor  v{__version__}\n")
     report = Report()
@@ -207,13 +217,16 @@ async def run(config_path: Path | None = None) -> int:
             "or keep the tunnel enabled (it resolves names remotely)."
         )
 
-    direct_ok, direct_detail = await _direct_probe(upstream, None)
+    direct_ok, direct_detail, direct_date = await _direct_probe(upstream, None)
     report.facts["direct_ok"] = direct_ok
     report.add(
         PASS if direct_ok else WARN,
         "direct route",
         direct_detail if direct_ok else f"unreachable ({direct_detail})",
     )
+    if direct_ok:
+        report.facts["clock_checked"] = True
+        await _check_clock(report, direct_date)
 
     # ------------------------------------------------------------- the tunnel
     if proxy_cfg.mode == "external":
@@ -224,14 +237,19 @@ async def run(config_path: Path | None = None) -> int:
     # ---------------------------------------------------------------- verdict
     print()
     tunnel_state = report.facts.get("tunnel_state")
+    direct_ok = bool(report.facts.get("direct_ok"))
     if report.failed:
         print(f"{report.failed} check(s) FAILED.")
     else:
         print("No failing checks.")
     if tunnel_state == "up":
         print("The tunnel works on this machine: Surplus is reachable through it.")
-    elif report.facts.get("direct_ok"):
-        print("Surplus is reachable directly here; the tunnel is optional.")
+    elif direct_ok:
+        print(
+            "Surplus is reachable WITHOUT the tunnel on this machine, so the router "
+            "already works here: click \"Disable (direct)\" on the Proxy tunnel card. "
+            "The tunnel only matters on networks where the direct route is blocked."
+        )
     for line in report.hints:
         print(f"  -> {line}")
     return 1 if report.failed else 0
@@ -263,7 +281,7 @@ async def _check_external(
             "and copy the exact port from its settings."
         )
         return
-    ok, detail = await _direct_probe(upstream, url)
+    ok, detail, _date = await _direct_probe(upstream, url)
     report.facts["tunnel_state"] = "up" if ok else "down"
     report.add(
         PASS if ok else FAIL,
@@ -293,36 +311,50 @@ async def _check_managed(
         )
         return
 
-    text = ""
+    servers: list[Server] = []
+    skipped: list[str] = []
     if sub_url:
-        text = await _fetch_subscription(report, sub_url)
-    if not text and raw_links:
-        report.add(INFO, "subscription", "using raw links from subscription_links")
-        text = raw_links
-
-    if text:
-        links = extract_links(text)
-        protocols = Counter(link.split("://", 1)[0].lower() for link in links)
-        shown = ", ".join(f"{name} x{count}" for name, count in protocols.most_common())
-        if links:
-            report.add(PASS, "link types", shown)
+        host = urlparse(sub_url).netloc
+        report.add(INFO, "subscription", f"host {host} ({mask_secret_url(sub_url)})")
+        fetch = await fetch_subscription(sub_url)
+        if fetch.ok:
+            report.add(PASS, "subscription", fetch.detail)
         else:
-            report.add(FAIL, "link types", "no share links found in the subscription")
-        servers, skipped = parse_subscription(text)
+            report.add(FAIL, "subscription", fetch.detail)
+            report.hint(
+                "The subscription address is unreachable from this network, or the "
+                "panel refuses this router's requests. Open the same link in a "
+                "browser on this machine; if the browser shows links, paste them "
+                "into subscription_links."
+            )
+        servers, skipped = fetch.servers, fetch.skipped
+        if fetch.date_header and not report.facts.get("clock_checked"):
+            report.facts["clock_checked"] = True
+            await _check_clock(report, fetch.date_header)
+    if not servers and raw_links:
+        report.add(INFO, "subscription", "using raw links from subscription_links")
+        servers, skipped = parse_subscription(raw_links)
+
+    if servers or skipped:
+        protocols = Counter(server.protocol for server in servers)
+        shown = ", ".join(f"{name} x{count}" for name, count in protocols.most_common())
+        report.add(
+            PASS if servers else FAIL, "route types", shown or "nothing this router can run"
+        )
         unsupported = sorted(
             {reason.split(":", 1)[0] for reason in skipped if "unsupported protocol" in reason}
         )
         report.add(
             PASS if servers else FAIL,
-            "usable links",
-            f"{len(servers)} of {len(links)} usable"
+            "usable routes",
+            f"{len(servers)} usable"
             + (f"; skipped: {'; '.join(skipped[:3])}" if skipped else ""),
         )
         if not servers:
             report.hint(
-                "None of these links can be used here. Xray-core speaks "
-                f"{', '.join(SUPPORTED_PROTOCOLS)} - ask the provider for a VLESS link, "
-                "or paste one into subscription_links."
+                "None of these configs can be used here. Xray-core speaks "
+                f"{', '.join(SUPPORTED_PROTOCOLS)} - ask the provider for a VLESS "
+                "config, or paste one into subscription_links."
             )
         elif unsupported:
             report.hint(f"Ignored unsupported protocol(s): {', '.join(unsupported)}.")
@@ -392,38 +424,6 @@ async def _check_managed(
             "network. Try another subscription, another network (e.g. mobile hotspot), "
             "and make sure the system clock is correct."
         )
-
-
-async def _fetch_subscription(report: Report, url: str) -> str:
-    host = urlparse(url).netloc
-    report.add(INFO, "subscription", f"host {host} ({mask_secret_url(url)})")
-    timeout = httpx.Timeout(connect=10.0, read=25.0, write=10.0, pool=10.0)
-    try:
-        async with httpx.AsyncClient(
-            timeout=timeout, follow_redirects=True, trust_env=False
-        ) as client:
-            response = await client.get(url, headers={"User-Agent": SUBSCRIPTION_USER_AGENT})
-    except Exception as exc:  # noqa: BLE001
-        report.add(
-            FAIL, "subscription", f"{host} unreachable: {type(exc).__name__}: {_short(exc)}"
-        )
-        report.hint(
-            "The subscription address itself is not reachable from this network. "
-            "Open it in a browser on the same machine; if that fails too, the panel "
-            "is blocked here - paste raw links into subscription_links instead."
-        )
-        return ""
-    report.add(
-        PASS if response.status_code == 200 else FAIL,
-        "subscription",
-        f"HTTP {response.status_code}, {len(response.content)} bytes",
-    )
-    if response.status_code == 200:
-        await _check_clock(report, response)
-        return response.text
-    if response.status_code in (401, 403, 404, 410):
-        report.hint("The panel answered but refused: the subscription link is invalid or expired.")
-    return ""
 
 
 def _port_open(host: str, port: int) -> bool:

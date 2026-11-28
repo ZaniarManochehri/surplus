@@ -16,7 +16,9 @@ with OpenAI-compatible or Anthropic-compatible protocols. The proxy:
 - **No secrets in code or commits.** API key comes from environment/config file
   (`config.ini`), which is gitignored. A `config.example.ini` is committed.
   Subscription URLs and share links are secrets of the same rank: config file
-  only, masked in every admin/status view, never logged.
+  only, masked in every admin/status view, never logged. That includes
+  library log lines - httpx's per-request INFO lines are silenced app-wide
+  because they printed the subscription URL in full.
 - **Code, comments, CLI output: English only.**
 - **Staged delivery:** one capability at a time; each stage verified against the
   real API before the next stage starts. Do not build ahead of the agreed plan.

@@ -32,18 +32,34 @@ import subprocess
 import time
 import zipfile
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 import httpx
 
 from .config import ProxyConfig, user_config_dir
-from .subscription import Server, build_client_config, parse_subscription
+from .subscription import (
+    Server,
+    build_client_config,
+    detect_format,
+    parse_subscription,
+)
 
 log = logging.getLogger("surplus.tunnel")
 
 XRAY_RELEASE_URL = "https://github.com/XTLS/Xray-core/releases/latest/download/{asset}"
-SUBSCRIPTION_USER_AGENT = "v2rayN/6.45"
+# Panels disagree about which User-Agent gets which format, and some answer
+# 403 to unknown clients (curl, python-httpx, an empty UA). These are tried in
+# order until one yields usable routes; the parser reads every shape they
+# return (links, Xray JSON, sing-box JSON).
+SUBSCRIPTION_USER_AGENTS = (
+    "v2rayN/6.45",
+    "v2rayNG/1.9.46",
+    "Hiddify/2.5.1",
+    "SFI/1.11.0 sing-box/1.11.0",
+)
+SUBSCRIPTION_USER_AGENT = SUBSCRIPTION_USER_AGENTS[0]
 PROBE_PATH = "/v1/models"
 # Post-quantum VLESS encryption (mlkem768x25519plus...) needs Xray v25+; an
 # older cached binary is replaced instead of failing on every route.
@@ -335,34 +351,18 @@ class Tunnel:
             return  # back off: don't hammer a panel that just failed
         self._last_fetch_attempt = now
         self._subscription_error = ""
-        timeout = httpx.Timeout(connect=15.0, read=25.0, write=15.0, pool=15.0)
-        try:
-            async with httpx.AsyncClient(
-                timeout=timeout, follow_redirects=True, trust_env=False
-            ) as client:
-                response = await client.get(
-                    cfg.subscription_url.strip(),
-                    headers={"User-Agent": SUBSCRIPTION_USER_AGENT},
-                )
-            response.raise_for_status()
-            servers, skipped = parse_subscription(response.text)
-        except Exception as exc:  # noqa: BLE001 - keep the old routes on failure
-            self._subscription_error = (
-                f"subscription fetch failed: {type(exc).__name__}: {exc}"
-            )
-            self._last_error = self._subscription_error
-            log.warning("%s", self._subscription_error)
+        result = await fetch_subscription(cfg.subscription_url)
+        self._skipped = result.skipped
+        if not result.ok:
+            self._subscription_error = result.detail
+            self._last_error = result.detail
+            log.warning("%s", result.detail)
             return
-        self._skipped = skipped
-        if not servers:
-            self._last_error = self._describe_no_links("subscription")
-            return
+        servers = result.servers
         previous = self._servers[self._index].address if self._servers else None
         self._servers = servers
         self._subscription_fetched_at = time.time()
-        log.info(
-            "subscription loaded: %d route(s), %d skipped", len(servers), len(skipped)
-        )
+        log.info("subscription loaded: %s", result.detail)
         self._index = 0
         if previous:
             for position, server in enumerate(servers):
@@ -615,6 +615,71 @@ class Tunnel:
 
 
 # ---------------------------------------------------------------- helpers
+
+
+@dataclass
+class SubscriptionFetch:
+    """Outcome of fetching a subscription: routes, skip reasons, a safe summary."""
+
+    servers: list[Server]
+    skipped: list[str]
+    detail: str
+    ok: bool
+    date_header: str | None = None
+
+
+def _describe_transport_error(exc: Exception) -> str:
+    """A useful message that cannot leak the subscription URL."""
+    if isinstance(exc, httpx.ConnectError):
+        return "cannot connect to the subscription host (name resolution or host)"
+    if isinstance(exc, httpx.TimeoutException):
+        return "the subscription host timed out"
+    return type(exc).__name__
+
+
+async def fetch_subscription(
+    url: str, transport: httpx.AsyncBaseTransport | None = None
+) -> SubscriptionFetch:
+    """Fetch a subscription, trying several User-Agents until routes come out.
+
+    ``detail`` is always safe to print: status, size, detected format and the
+    User-Agent that worked - never the URL or any link.
+    """
+    timeout = httpx.Timeout(connect=15.0, read=25.0, write=15.0, pool=15.0)
+    attempts: list[str] = []
+    async with httpx.AsyncClient(
+        timeout=timeout, follow_redirects=True, trust_env=False, transport=transport
+    ) as client:
+        for user_agent in SUBSCRIPTION_USER_AGENTS:
+            try:
+                response = await client.get(url.strip(), headers={"User-Agent": user_agent})
+            except Exception as exc:  # noqa: BLE001 - reported, never raised
+                attempts.append(f"{_describe_transport_error(exc)} (UA {user_agent})")
+                break  # every attempt targets the same host: the rest would fail alike
+            if response.status_code != 200:
+                attempts.append(f"HTTP {response.status_code} (UA {user_agent})")
+                continue
+            servers, skipped = parse_subscription(response.text)
+            if servers:
+                return SubscriptionFetch(
+                    servers,
+                    skipped,
+                    (
+                        f"HTTP 200, {len(response.content)} bytes, "
+                        f"{detect_format(response.text)}, {len(servers)} route(s) "
+                        f"via UA {user_agent}"
+                    ),
+                    ok=True,
+                    date_header=response.headers.get("date"),
+                )
+            attempts.append(
+                f"{detect_format(response.text)} with no usable route (UA {user_agent})"
+            )
+            if skipped:
+                attempts.append("; ".join(skipped[:3]))
+    return SubscriptionFetch(
+        [], [], "subscription fetch failed: " + " | ".join(attempts), ok=False
+    )
 
 
 def _iso(timestamp: float | None) -> str | None:

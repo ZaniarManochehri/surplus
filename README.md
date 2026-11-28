@@ -187,6 +187,14 @@ Enable/disable is a button in the admin panel and applies live — no restart.
 When the tunnel is disabled or fully down, the router falls back to a direct
 connection and keeps reporting why the tunnel is not up.
 
+The subscription may arrive in any of these shapes, and all are read: a
+share-link list, plain or base64 (`vless://`, `vmess://`, `trojan://`,
+`ss://`); Xray JSON, i.e. full client configs, which Marzban-family panels
+send to Xray-capable clients; or sing-box JSON (`vless`, `vmess`, `trojan`
+and `shadowsocks` outbounds are converted). Panels that answer 403 to an
+unknown client are handled by trying several User-Agents in a row. The
+**Proxy tunnel** card reports the detected format and any skipped config.
+
 The subscription URL is stored only in `config.ini` (gitignored) and is shown
 masked in the panel, exactly like the API key. If your subscription panel is
 itself unreachable, paste raw share links (`vless://…`, one per line) into
@@ -238,6 +246,8 @@ prints what to fix. What it usually finds:
 - **Unsupported protocol** (`hysteria2`, `tuic`): Xray-core only speaks
   `vless`, `vmess`, `trojan` and `ss`. Ask the provider for a VLESS link, or
   paste one into `subscription_links`.
+- **`clash-yaml with no usable route`**: the panel only serves Clash configs.
+  Ask for a v2ray / Xray / sing-box subscription link instead.
 - **`xray download failed`**: github.com is blocked on that network. Put
   `xray` on the `PATH`, or install it anywhere and set `[proxy] xray_binary`.
 - **`did not listen`** in the tunnel test: an antivirus or SmartScreen rule is

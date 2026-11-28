@@ -45,6 +45,11 @@ from .tunnel import Tunnel
 
 log = logging.getLogger("surplus")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+# httpx logs every request line at INFO. For the subscription URL that would
+# print a secret into the terminal (and into anything that captures it), and
+# for the doctor output that users are asked to share.
+for _logger_name in ("httpx", "httpcore"):
+    logging.getLogger(_logger_name).setLevel(logging.WARNING)
 
 # Where config.ini lives: ./config.ini when present, else the per-user dir
 # (%APPDATA%\surplus-router on Windows). See config.resolve_config_path.

@@ -306,6 +306,19 @@ downloads the release binary into the per-user config dir (or uses
     stale Xray cache (older than v25) is replaced; an xray already on the
     PATH is the fallback when the GitHub download is blocked. 187 unit tests,
     8/8 `verify_proxy` checks.
+5f. ✅ **Subscription formats + client negotiation**: a real Marzban-family
+    panel returned Xray JSON (a list of full client configs) to the router's
+    User-Agent, so "no share links found" was the whole diagnosis. The parser
+    now reads share links (plain/base64, either alphabet), Xray JSON (config
+    list, one config, or bare outbounds; proxy outbounds verbatim, with
+    `proxySettings` chains kept) and sing-box JSON (vless/vmess/trojan/
+    shadowsocks converted, others reported as unsupported). The fetch tries
+    several User-Agents in a row - panels that 403 unknown clients are
+    covered - and `detail` names the detected format without ever printing
+    the URL. httpx request lines are silenced app-wide for the same reason
+    (they printed the subscription URL into the terminal and into the doctor
+    output users share). 212 unit tests; live doctor on the affected
+    subscription: `xray-json, 14 route(s)`, tunnel test up.
 6. **Anthropic skin**: `/anthropic/*` passthrough + filtered model list
 7. **End-to-end verification**: OpenAI SDK and Claude Code through the proxy;
    rejection test for a capped-out model; streaming test; refresh test
